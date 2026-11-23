@@ -15,7 +15,7 @@ enum OCR {
     static func recognize(_ image: CGImage, file: URL? = nil) throws -> (text: String, engine: String) {
         if ProcessInfo.processInfo.environment["LOCALOCR_ENGINE"] != "vision",
            let lines = PaddleEngine.shared.recognize(image, file: file) {
-            let converted = lines.map { Line(text: normalizePunctuation($0.text),
+            let converted = lines.map { Line(text: normalizePunctuation(fixDigitLetterConfusion($0.text)),
                                              box: CGRect(x: $0.box.minX, y: CGFloat(image.height) - $0.box.maxY,
                                                          width: $0.box.width, height: $0.box.height)) }
             return (layout(converted), "PaddleOCR")
@@ -36,7 +36,7 @@ enum OCR {
                keepsSymbols(of: line.text, in: english[0].text) {
                 line.text = english[0].text
             }
-            line.text = normalizePunctuation(fixCapitalI(line.text))
+            line.text = normalizePunctuation(fixDigitLetterConfusion(fixCapitalI(line.text)))
             return line
         }
         return layout(recoverLinePrefixes(image, lines))
@@ -181,6 +181,35 @@ enum OCR {
         for match in capitalIPattern.matches(in: text, range: NSRange(text.startIndex..., in: text)).reversed() {
             let range = Range(match.range, in: text)!
             result.replaceSubrange(range, with: text[range].replacingOccurrences(of: "l", with: "I"))
+        }
+        return result
+    }
+
+    private static let alnumToken = try! NSRegularExpression(pattern: "[A-Za-z0-9]+")
+
+    // O/0 look alike in many fonts. Fix only unambiguous words: "Paddle0CR" (a
+    // word whose only digits are zeros between letters) and "2O26" (a number
+    // with O between digits). Mixed IDs and hex such as req_01HZX or
+    // deadbeef0cafe are left alone, since a rule cannot tell them apart.
+    static func fixDigitLetterConfusion(_ text: String) -> String {
+        var result = text
+        for match in alnumToken.matches(in: text, range: NSRange(text.startIndex..., in: text)).reversed() {
+            let range = Range(match.range, in: text)!
+            let token = Array(text[range])
+            guard token.count >= 3 else { continue }
+            let digits = token.filter(\.isNumber), letters = token.filter(\.isLetter)
+            var fixed = token
+            if !digits.isEmpty, digits.allSatisfy({ $0 == "0" }), letters.count >= 3,
+               letters.contains(where: { !"abcdefABCDEF".contains($0) }) {
+                for i in 1..<(token.count - 1) where token[i] == "0" && token[i - 1].isLetter && token[i + 1].isLetter {
+                    fixed[i] = token[i - 1].isUppercase || token[i + 1].isUppercase ? "O" : "o"
+                }
+            } else if digits.count >= 2, !letters.isEmpty, letters.allSatisfy({ $0 == "O" || $0 == "o" }) {
+                for i in 1..<(token.count - 1) where token[i].isLetter && token[i - 1].isNumber && token[i + 1].isNumber {
+                    fixed[i] = "0"
+                }
+            }
+            if fixed != token { result.replaceSubrange(range, with: String(fixed)) }
         }
         return result
     }
@@ -751,6 +780,8 @@ func selfTest() throws {
     guard blankText.isEmpty else { fatalError("Blank image produced text") }
     let merged = OCR.mergeIntoParagraph("当网关向上游转发请求时，\n客户端会断开。\n\nThe gateway returns\nHTTP 503.")
     guard merged == "当网关向上游转发请求时，客户端会断开。The gateway returns HTTP 503." else { fatalError("Merge failed: \(merged)") }
+    let confusion = OCR.fixDigitLetterConfusion("Paddle0CR c0nfig 7f3a9c1e0b2d4e58 deadbeef0cafe req_01HZX 2O26 gpt-4o l1I0O")
+    guard confusion == "PaddleOCR config 7f3a9c1e0b2d4e58 deadbeef0cafe req_01HZX 2026 gpt-4o l1I0O" else { fatalError("O/0 fix failed: \(confusion)") }
     print("PASS (\(engine)): Chinese, English, digits, blank-image recognition, and paragraph merge")
     print(text)
 }
